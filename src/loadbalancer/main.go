@@ -3,6 +3,9 @@ package main
 import "loadbalancer/gateway"
 
 func main() {
-	router := gateway.CreateRouter()
-	gateway.StartRouter(router)
+	gtw := gateway.NewGateway()
+
+	if backend := gtw.NextServer(); backend != nil {
+		// do processing
+	}
 }
