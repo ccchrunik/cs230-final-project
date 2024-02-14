@@ -1,10 +1,16 @@
 package gateway
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"time"
 )
+
+var gtw = NewGateway()
 
 func NewBackend(rawUrl string) *Backend {
 	serverUrl, err := url.Parse(rawUrl)
@@ -12,9 +18,25 @@ func NewBackend(rawUrl string) *Backend {
 		return nil
 	}
 
+	proxy := httputil.NewSingleHostReverseProxy(serverUrl)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[%s] %s\n", serverUrl.Host, err.Error())
+		retries := GetRetryFromContext(r)
+		if retries < 3 {
+			select {
+			case <-time.After(10 * time.Millisecond):
+				ctx := context.WithValue(r.Context(), Retry, retries+1)
+				proxy.ServeHTTP(w, r.WithContext(ctx))
+			}
+			return
+		}
+
+		gtw.RemoveServer(serverUrl.String())
+	}
+
 	return &Backend{
 		URL:          serverUrl,
-		ReverseProxy: httputil.NewSingleHostReverseProxy(serverUrl),
+		ReverseProxy: proxy,
 	}
 }
 
@@ -25,6 +47,10 @@ type Backend struct {
 
 func (b *Backend) rawUrl() string {
 	return b.URL.String()
+}
+
+func (b *Backend) Url() *url.URL {
+	return b.URL
 }
 
 func NewServerPool() *ServerPool {
@@ -47,20 +73,32 @@ func (p *ServerPool) Get(index int) *Backend {
 	return p.alives[index]
 }
 
-func (p *ServerPool) Add(backend *Backend) {
-	p.alives = append(p.alives, backend)
+func (p *ServerPool) Add(backends ...*Backend) {
+	p.alives = append(p.alives, backends...)
 }
 
-func (p *ServerPool) Remove(backend *Backend) {
+func (p *ServerPool) Remove(rawUrl string) {
 	var index int
 	for i, b := range p.alives {
-		if b.rawUrl() == backend.rawUrl() {
+		if rawUrl == b.rawUrl() {
 			index = i
 			break
 		}
 	}
+	backend := p.alives[index]
 	p.alives = append(p.alives[:index], p.alives[index+1:]...)
 	p.dead = append(p.dead, backend)
+}
+
+func (p *ServerPool) Delete(rawUrl string) {
+	var index int
+	for i, b := range p.dead {
+		if rawUrl == b.rawUrl() {
+			index = i
+			break
+		}
+	}
+	p.dead = append(p.dead[:index], p.dead[index+1:]...)
 }
 
 func NewGateway() *Gateway {
@@ -69,13 +107,23 @@ func NewGateway() *Gateway {
 		policy:     &RoundRobinPolicy{},
 		syncCh:     make(chan struct{}),
 		addCh:      make(chan *Backend),
-		removeCh:   make(chan *Backend),
+		removeCh:   make(chan string),
 		nextCh:     make(chan *BackendResult),
+		copyCh:     make(chan *CopyResult),
+		deleteCh:   make(chan *DeleteResult),
 	}
 
 	go gtw.process()
 
 	return &gtw
+}
+
+type CopyResult struct {
+	resultCh chan []*Backend
+}
+
+type DeleteResult struct {
+	resultCh chan []*Backend
 }
 
 type BackendResult struct {
@@ -87,22 +135,40 @@ type Gateway struct {
 	policy     Policy
 	syncCh     chan struct{}
 	addCh      chan *Backend
-	removeCh   chan *Backend
+	removeCh   chan string
+	deleteCh   chan *DeleteResult
+	copyCh     chan *CopyResult
 	nextCh     chan *BackendResult
 }
 
 func (g *Gateway) process() {
 	var backend *Backend
+	var rawUrl string
 	var backendResult *BackendResult
+	var copyResult *CopyResult
+	var deleteResult *DeleteResult
 
 	for {
 		select {
 		case <-g.syncCh:
 			// no-op
+
+		case copyResult = <-g.copyCh:
+			copied := make([]*Backend, g.serverPool.Len())
+			copy(copied, g.serverPool.alives)
+			copyResult.resultCh <- copied
+
+		case deleteResult = <-g.deleteCh:
+			deleted := g.serverPool.dead
+			g.serverPool.dead = []*Backend{}
+			deleteResult.resultCh <- deleted
+
 		case backend = <-g.addCh:
 			g.serverPool.Add(backend)
-		case backend = <-g.removeCh:
-			g.serverPool.Remove(backend)
+
+		case rawUrl = <-g.removeCh:
+			g.serverPool.Remove(rawUrl)
+
 		case backendResult = <-g.nextCh:
 			if len(g.serverPool.alives) == 0 {
 				backendResult.resultCh <- nil
@@ -117,16 +183,59 @@ func (g *Gateway) sync() {
 	g.syncCh <- struct{}{}
 }
 
+func (g *Gateway) next() *Backend {
+	return g.policy.Select(g.serverPool)
+}
+
+func (g *Gateway) copy() []*Backend {
+	copyResult := CopyResult{
+		resultCh: make(chan []*Backend),
+	}
+	g.copyCh <- &copyResult
+	return <-copyResult.resultCh
+}
+
+func (g *Gateway) healthCheck() {
+	backends := g.copy()
+	for _, b := range backends {
+		go func(u *url.URL) {
+			alive := isBackendAlive(u)
+			if !alive {
+				g.removeCh <- u.String()
+			}
+		}(b.URL)
+	}
+}
+
+func (g *Gateway) notify() {
+	// send to monitor for alive servers
+	deleteResult := DeleteResult{
+		resultCh: make(chan []*Backend),
+	}
+
+	g.deleteCh <- &deleteResult
+	deleted := <-deleteResult.resultCh
+
+	// TODO: send deleted servers to the monitor
+	fmt.Println(len(deleted))
+}
+
 func (g *Gateway) AddServer(backend *Backend) {
+	g.AddServerAsync(backend)
+	g.sync()
+}
+
+func (g *Gateway) AddServerAsync(backend *Backend) {
 	g.addCh <- backend
 }
 
-func (g *Gateway) RemoveServer(backend *Backend) {
-	g.removeCh <- backend
+func (g *Gateway) RemoveServer(rawUrl string) {
+	g.RemoveServerAsync(rawUrl)
+	g.sync()
 }
 
-func (g *Gateway) next() *Backend {
-	return g.policy.Next(g.serverPool)
+func (g *Gateway) RemoveServerAsync(rawUrl string) {
+	g.removeCh <- rawUrl
 }
 
 func (g *Gateway) NextServer() *Backend {
