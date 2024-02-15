@@ -26,12 +26,14 @@ func NewBackend(rawUrl string, gtw *Gateway) *Backend {
 	return &Backend{
 		URL:          serverUrl,
 		ReverseProxy: proxy,
+		Heartbeat:    0,
 	}
 }
 
 type Backend struct {
 	URL          *url.URL
 	ReverseProxy *httputil.ReverseProxy
+	Heartbeat    int
 }
 
 func (b *Backend) rawUrl() string {
@@ -79,7 +81,12 @@ func (p *ServerPool) Remove(rawUrl string) {
 	p.dead = append(p.dead, backend)
 }
 
-func (p *ServerPool) Delete(rawUrl string) {
+func (p *ServerPool) Resurrect(rawUrl string) {
+	backend := p.Delete(rawUrl)
+	p.Add(backend)
+}
+
+func (p *ServerPool) Delete(rawUrl string) *Backend {
 	var index int
 	for i, b := range p.dead {
 		if rawUrl == b.rawUrl() {
@@ -87,19 +94,23 @@ func (p *ServerPool) Delete(rawUrl string) {
 			break
 		}
 	}
+	backend := p.dead[index]
 	p.dead = append(p.dead[:index], p.dead[index+1:]...)
+	return backend
 }
 
 func NewGateway() *Gateway {
 	gtw := Gateway{
-		serverPool: NewServerPool(),
-		policy:     &RoundRobinPolicy{},
-		syncCh:     make(chan struct{}),
-		addCh:      make(chan *Backend),
-		removeCh:   make(chan string),
-		nextCh:     make(chan *BackendResult),
-		copyCh:     make(chan *CopyResult),
-		deleteCh:   make(chan *DeleteResult),
+		serverPool:  NewServerPool(),
+		policy:      &RoundRobinPolicy{},
+		syncCh:      make(chan struct{}),
+		addCh:       make(chan *Backend),
+		removeCh:    make(chan string),
+		resurrectCh: make(chan string),
+		nextCh:      make(chan *BackendResult),
+		copyAliveCh: make(chan *CopyResult),
+		copyDeadCh:  make(chan *CopyResult),
+		deleteCh:    make(chan *DeleteResult),
 	}
 
 	go gtw.process()
@@ -120,14 +131,16 @@ type BackendResult struct {
 }
 
 type Gateway struct {
-	serverPool *ServerPool
-	policy     Policy
-	syncCh     chan struct{}
-	addCh      chan *Backend
-	removeCh   chan string
-	deleteCh   chan *DeleteResult
-	copyCh     chan *CopyResult
-	nextCh     chan *BackendResult
+	serverPool  *ServerPool
+	policy      Policy
+	syncCh      chan struct{}
+	addCh       chan *Backend
+	removeCh    chan string
+	resurrectCh chan string
+	deleteCh    chan *DeleteResult
+	copyAliveCh chan *CopyResult
+	copyDeadCh  chan *CopyResult
+	nextCh      chan *BackendResult
 }
 
 func (g *Gateway) process() {
@@ -142,9 +155,14 @@ func (g *Gateway) process() {
 		case <-g.syncCh:
 			// no-op
 
-		case copyResult = <-g.copyCh:
-			copied := make([]*Backend, g.serverPool.Len())
+		case copyResult = <-g.copyAliveCh:
+			copied := make([]*Backend, len(g.serverPool.alives))
 			copy(copied, g.serverPool.alives)
+			copyResult.resultCh <- copied
+
+		case copyResult = <-g.copyDeadCh:
+			copied := make([]*Backend, len(g.serverPool.dead))
+			copy(copied, g.serverPool.dead)
 			copyResult.resultCh <- copied
 
 		case deleteResult = <-g.deleteCh:
@@ -157,6 +175,9 @@ func (g *Gateway) process() {
 
 		case rawUrl = <-g.removeCh:
 			g.serverPool.Remove(rawUrl)
+
+		case rawUrl = <-g.resurrectCh:
+			g.serverPool.Resurrect(rawUrl)
 
 		case backendResult = <-g.nextCh:
 			if len(g.serverPool.alives) == 0 {
@@ -176,16 +197,24 @@ func (g *Gateway) next() *Backend {
 	return g.policy.Select(g.serverPool)
 }
 
-func (g *Gateway) copy() []*Backend {
+func (g *Gateway) copyAlive() []*Backend {
 	copyResult := CopyResult{
 		resultCh: make(chan []*Backend),
 	}
-	g.copyCh <- &copyResult
+	g.copyAliveCh <- &copyResult
+	return <-copyResult.resultCh
+}
+
+func (g *Gateway) copyDead() []*Backend {
+	copyResult := CopyResult{
+		resultCh: make(chan []*Backend),
+	}
+	g.copyDeadCh <- &copyResult
 	return <-copyResult.resultCh
 }
 
 func (g *Gateway) healthCheck() {
-	backends := g.copy()
+	backends := g.copyAlive()
 	var wg sync.WaitGroup
 	wg.Add(len(backends))
 	for _, b := range backends {
@@ -200,17 +229,39 @@ func (g *Gateway) healthCheck() {
 	wg.Wait()
 }
 
-func (g *Gateway) healthCheckAsync() {
-	backends := g.copy()
+func (g *Gateway) resurrect(rawUrl string) {
+	g.resurrectCh <- rawUrl
+	g.sync()
+}
+
+func (g *Gateway) resurrectServers() {
+	backends := g.copyDead()
+	var wg sync.WaitGroup
+	wg.Add(len(backends))
 	for _, b := range backends {
 		go func(u *url.URL) {
-			alive := isBackendAlive(u.String() + "/health_check")
-			if !alive {
-				g.RemoveServer(u.String())
+			rawUrl := u.String()
+			alive := isBackendAlive(rawUrl + "/health_check")
+			if alive {
+				g.resurrect(rawUrl)
 			}
+			wg.Done()
 		}(b.URL)
 	}
+	wg.Wait()
 }
+
+// func (g *Gateway) healthCheckAsync() {
+// 	backends := g.copy()
+// 	for _, b := range backends {
+// 		go func(u *url.URL) {
+// 			alive := isBackendAlive(u.String() + "/health_check")
+// 			if !alive {
+// 				g.RemoveServer(u.String())
+// 			}
+// 		}(b.URL)
+// 	}
+// }
 
 func (g *Gateway) report() error {
 	// send to monitor for alive servers
