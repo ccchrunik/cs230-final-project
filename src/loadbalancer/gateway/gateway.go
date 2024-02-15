@@ -1,38 +1,27 @@
 package gateway
 
 import (
-	"context"
-	"fmt"
 	"log"
-	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 )
 
-var gtw = NewGateway()
+var DefaultGateway = NewGateway()
 
-func NewBackend(rawUrl string) *Backend {
+func Reset() {
+	DefaultGateway = NewGateway()
+}
+
+func NewBackend(rawUrl string, gtw *Gateway) *Backend {
 	serverUrl, err := url.Parse(rawUrl)
 	if err != nil {
 		return nil
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(serverUrl)
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[%s] %s\n", serverUrl.Host, err.Error())
-		retries := GetRetryFromContext(r)
-		if retries < 3 {
-			select {
-			case <-time.After(10 * time.Millisecond):
-				ctx := context.WithValue(r.Context(), Retry, retries+1)
-				proxy.ServeHTTP(w, r.WithContext(ctx))
-			}
-			return
-		}
-
-		gtw.RemoveServer(serverUrl.String())
-	}
+	proxy.ErrorHandler = genRetryErrorHandler(serverUrl, proxy, gtw)
 
 	return &Backend{
 		URL:          serverUrl,
@@ -197,17 +186,33 @@ func (g *Gateway) copy() []*Backend {
 
 func (g *Gateway) healthCheck() {
 	backends := g.copy()
+	var wg sync.WaitGroup
+	wg.Add(len(backends))
 	for _, b := range backends {
 		go func(u *url.URL) {
-			alive := isBackendAlive(u)
+			alive := isBackendAlive(u.String() + "/health_check")
 			if !alive {
-				g.removeCh <- u.String()
+				g.RemoveServer(u.String())
+			}
+			wg.Done()
+		}(b.URL)
+	}
+	wg.Wait()
+}
+
+func (g *Gateway) healthCheckAsync() {
+	backends := g.copy()
+	for _, b := range backends {
+		go func(u *url.URL) {
+			alive := isBackendAlive(u.String() + "/health_check")
+			if !alive {
+				g.RemoveServer(u.String())
 			}
 		}(b.URL)
 	}
 }
 
-func (g *Gateway) notify() {
+func (g *Gateway) report() error {
 	// send to monitor for alive servers
 	deleteResult := DeleteResult{
 		resultCh: make(chan []*Backend),
@@ -217,7 +222,16 @@ func (g *Gateway) notify() {
 	deleted := <-deleteResult.resultCh
 
 	// TODO: send deleted servers to the monitor
-	fmt.Println(len(deleted))
+	log.Printf("Removed Servers:%d\n", len(deleted))
+
+	deletedServers := make([]string, len(deleted))
+	for _, v := range deleted {
+		deletedServers = append(deletedServers, v.rawUrl())
+	}
+
+	err := reportDeadBackends("http://localhost:3000/report", deletedServers)
+
+	return err
 }
 
 func (g *Gateway) AddServer(backend *Backend) {

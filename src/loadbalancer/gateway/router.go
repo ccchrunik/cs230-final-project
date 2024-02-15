@@ -3,55 +3,43 @@ package gateway
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
-func CreateRouter(port int) *http.Server {
+type Servers struct {
+	Adds    []string `json:"adds"`
+	Removes []string `json:"removes"`
+}
+
+func CreateServer(port int, gtw *Gateway) *http.Server {
 	return &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: http.HandlerFunc(loadbalancing),
+		Handler: http.HandlerFunc(genLoadBalancer(gtw)),
 	}
 }
 
-// func CreateRouter() *gin.Engine {
-// 	router := gin.Default()
+func CreateAdminServer(port int, gtw *Gateway) *gin.Engine {
+	r := gin.Default()
 
-// 	// Define the routes for the API Gateway
-// 	router.Any("/service1/*path", createProxy("http://localhost:8081"))
-// 	router.Any("/service2/*path", createProxy("http://localhost:8082"))
+	r.POST("/update_servers", func(c *gin.Context) {
+		var servers Servers
 
-// 	return router
-// }
+		if c.ShouldBind(&servers) == nil {
+			c.JSON(http.StatusBadRequest, nil)
+			return
+		}
 
-// func StartRouter(router *gin.Engine) {
-// 	// Start the API Gateway
-// 	router.Run(":8080")
-// }
+		for _, a := range servers.Adds {
+			gtw.AddServer(NewBackend(a, gtw))
+		}
 
-// // source 1: https://gist.github.com/seblegall/2a2697fc56417b24a7ec49eb4a8d7b1b
-// // source 2: https://levelup.gitconnected.com/build-api-gateway-using-go-gin-a-comprehensive-guide-for-gateway-2-6bc1f5bd79a3
+		for _, d := range servers.Removes {
+			gtw.RemoveServer(d)
+		}
 
-// func createProxy(target string) gin.HandlerFunc {
-// 	return func(c *gin.Context) {
-// 		// Parse the target URL
-// 		targetURL, _ := url.Parse(target)
+		c.JSON(http.StatusOK, nil)
+	})
 
-// 		// Create the reverse proxy
-// 		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-// 		// Modify the request
-// 		// c.Request.URL.Scheme = targetURL.Scheme
-// 		// c.Request.URL.Host = targetURL.Host
-// 		// c.Request.URL.Path = c.Param("path")
-
-// 		proxy.Director = func(req *http.Request) {
-// 			req.Header = c.Request.Header
-// 			req.Host = targetURL.Host
-// 			req.URL.Scheme = targetURL.Scheme
-// 			req.URL.Host = targetURL.Host
-// 			req.URL.Path = c.Param("path")
-// 		}
-
-// 		// Let the reverse proxy do its job
-// 		proxy.ServeHTTP(c.Writer, c.Request)
-// 	}
-// }
+	return r
+}

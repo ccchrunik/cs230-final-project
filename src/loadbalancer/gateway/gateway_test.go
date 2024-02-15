@@ -5,8 +5,10 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emirpasic/gods/sets/hashset"
+	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -35,7 +37,7 @@ func TestGatewayCoreSequential(t *testing.T) {
 	serverNum := 10000
 	backends := []*Backend{}
 	for i := 0; i < serverNum; i++ {
-		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i))
+		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i), gtw)
 		backends = append(backends, backend)
 		gtw.AddServer(backend)
 	}
@@ -95,7 +97,7 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 	wg.Add(serverNum)
 	for _, rawUrl := range backendSet.Values() {
 		go func(rawUrl string) {
-			backend := NewBackend(rawUrl)
+			backend := NewBackend(rawUrl, gtw)
 			gtw.AddServer(backend)
 			wg.Done()
 		}(rawUrl.(string))
@@ -177,6 +179,65 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 		diff := remainingSet.Difference(resultSet)
 		assert.True(t, diff.Empty())
 	}
+}
+
+func TestGatewayHealthCheckReport(t *testing.T) {
+	gtw := NewGateway()
+
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	serverNum := 10000
+	for i := 0; i < serverNum; i++ {
+		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i), gtw)
+		gtw.AddServer(backend)
+	}
+
+	deadSet := hashset.New()
+	aliveSet := hashset.New()
+	for i := 0; i < serverNum; i++ {
+		rawUrl := fmt.Sprintf("http://localhost:%d", 8000+i)
+		if i%100 == 0 {
+			httpmock.RegisterResponder("GET", rawUrl+"/health_check",
+				httpmock.NewStringResponder(500, fmt.Sprintf("Service %d is Down", i)))
+			deadSet.Add(rawUrl)
+		} else {
+			httpmock.RegisterResponder("GET", rawUrl+"/health_check",
+				httpmock.NewStringResponder(200, fmt.Sprintf("Service %d is Alive", i)))
+			aliveSet.Add(rawUrl)
+		}
+	}
+
+	// register monitor endpoint
+	monitorUrl := "http://localhost:3000/report"
+	httpmock.RegisterResponder("POST", monitorUrl, httpmock.NewStringResponder(200, "Success"))
+
+	assert.Equal(t, serverNum, gtw.serverPool.Len())
+	assert.Equal(t, 0, len(gtw.serverPool.dead))
+
+	duration := time.Millisecond
+	healthCheckWithCount(gtw, duration, 1)
+
+	assert.Equal(t, aliveSet.Size(), gtw.serverPool.Len())
+	assert.Equal(t, deadSet.Size(), len(gtw.serverPool.dead))
+
+	remainingSet := hashset.New()
+	remainingServers := gtw.copy()
+	for _, s := range remainingServers {
+		remainingSet.Add(s.rawUrl())
+	}
+
+	diff := remainingSet.Difference(aliveSet)
+	assert.True(t, diff.Empty())
+
+	err := gtw.report()
+	assert.Nil(t, err)
+	assert.Equal(t, aliveSet.Size(), gtw.serverPool.Len())
+	assert.Equal(t, 0, len(gtw.serverPool.dead))
+}
+
+func TestGatewayRetry(t *testing.T) {
+
 }
 
 // func TestGatewayHTTP(t *testing.T) {
