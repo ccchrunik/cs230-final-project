@@ -32,18 +32,18 @@ func TestGatewayCoreSequential(t *testing.T) {
 	gtw := NewGateway()
 
 	assert.Equal(t, 0, len(gtw.serverPool.alives))
-	assert.Equal(t, 0, len(gtw.serverPool.dead))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
 
 	serverNum := 10000
 	backends := []*Backend{}
 	for i := 0; i < serverNum; i++ {
 		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i), gtw)
 		backends = append(backends, backend)
-		gtw.AddServer(backend)
+		gtw.Add(backend)
 	}
 
 	assert.Equal(t, serverNum, len(gtw.serverPool.alives))
-	assert.Equal(t, 0, len(gtw.serverPool.dead))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
 
 	for i := 0; i < serverNum; i++ {
 		assert.Equal(t, backends[i].rawUrl(), gtw.serverPool.alives[i].rawUrl())
@@ -51,11 +51,11 @@ func TestGatewayCoreSequential(t *testing.T) {
 
 	removedBackendsIds := map[int]bool{10: true, 27: true, 43: true}
 	for id := range removedBackendsIds {
-		gtw.RemoveServer(backends[id].rawUrl())
+		gtw.Remove(backends[id].rawUrl())
 	}
 
 	assert.Equal(t, serverNum-len(removedBackendsIds), len(gtw.serverPool.alives))
-	assert.Equal(t, len(removedBackendsIds), len(gtw.serverPool.dead))
+	assert.Equal(t, len(removedBackendsIds), len(gtw.serverPool.disconnected))
 
 	next := 0
 	for i, b := range backends {
@@ -69,7 +69,7 @@ func TestGatewayCoreSequential(t *testing.T) {
 	// test repeated selection and remove
 	crashedServerIds := []int{80, 88, 97}
 	for _, id := range crashedServerIds {
-		gtw.RemoveServer(backends[id].rawUrl())
+		gtw.Remove(backends[id].rawUrl())
 		removedBackendsIds[id] = true
 		for i, b := range backends {
 			if _, ok := removedBackendsIds[i]; ok {
@@ -85,7 +85,7 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 	gtw := NewGateway()
 
 	assert.Equal(t, 0, len(gtw.serverPool.alives))
-	assert.Equal(t, 0, len(gtw.serverPool.dead))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
 
 	serverNum := 10000
 	backendSet := hashset.New()
@@ -98,7 +98,7 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 	for _, rawUrl := range backendSet.Values() {
 		go func(rawUrl string) {
 			backend := NewBackend(rawUrl, gtw)
-			gtw.AddServer(backend)
+			gtw.Add(backend)
 			wg.Done()
 		}(rawUrl.(string))
 	}
@@ -106,7 +106,7 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 
 	assert.Equal(t, serverNum, backendSet.Size())
 	assert.Equal(t, serverNum, len(gtw.serverPool.alives))
-	assert.Equal(t, 0, len(gtw.serverPool.dead))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
 
 	servers := gtw.copyAlive()
 	for i := 0; i < serverNum; i++ {
@@ -122,14 +122,14 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 	wg.Add(removedNum)
 	for _, rawUrl := range removedSet.Values() {
 		go func(rawUrl string) {
-			gtw.RemoveServer(rawUrl)
+			gtw.Remove(rawUrl)
 			wg.Done()
 		}(rawUrl.(string))
 	}
 	wg.Wait()
 
 	assert.Equal(t, serverNum-removedNum, len(gtw.serverPool.alives))
-	assert.Equal(t, removedNum, len(gtw.serverPool.dead))
+	assert.Equal(t, removedNum, len(gtw.serverPool.disconnected))
 
 	remainingServers := gtw.copyAlive()
 	remainingSet := backendSet.Difference(removedSet)
@@ -148,7 +148,7 @@ func TestGatewayCoreConcurrent(t *testing.T) {
 
 	for _, v := range newRemovedServers.Values() {
 		rawUrl := v.(string)
-		gtw.RemoveServer(rawUrl)
+		gtw.Remove(rawUrl)
 		remainingSet.Remove(rawUrl)
 		slen := gtw.serverPool.Len()
 
@@ -190,17 +190,17 @@ func TestGatewayHealthCheckReport(t *testing.T) {
 	serverNum := 10000
 	for i := 0; i < serverNum; i++ {
 		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i), gtw)
-		gtw.AddServer(backend)
+		gtw.Add(backend)
 	}
 
-	deadSet := hashset.New()
 	aliveSet := hashset.New()
+	disconnectedSet := hashset.New()
 	for i := 0; i < serverNum; i++ {
 		rawUrl := fmt.Sprintf("http://localhost:%d", 8000+i)
 		if i%100 == 0 {
 			httpmock.RegisterResponder("GET", rawUrl+"/health_check",
 				httpmock.NewStringResponder(500, fmt.Sprintf("Service %d is Down", i)))
-			deadSet.Add(rawUrl)
+			disconnectedSet.Add(rawUrl)
 		} else {
 			httpmock.RegisterResponder("GET", rawUrl+"/health_check",
 				httpmock.NewStringResponder(200, fmt.Sprintf("Service %d is Alive", i)))
@@ -212,14 +212,16 @@ func TestGatewayHealthCheckReport(t *testing.T) {
 	monitorUrl := "http://localhost:3000/report"
 	httpmock.RegisterResponder("POST", monitorUrl, httpmock.NewStringResponder(200, "Success"))
 
-	assert.Equal(t, serverNum, gtw.serverPool.Len())
+	assert.Equal(t, serverNum, len(gtw.serverPool.alives))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
 	assert.Equal(t, 0, len(gtw.serverPool.dead))
 
+	// do health check
 	duration := time.Millisecond
 	healthCheckWithCount(gtw, duration, 1)
 
-	assert.Equal(t, aliveSet.Size(), gtw.serverPool.Len())
-	assert.Equal(t, deadSet.Size(), len(gtw.serverPool.dead))
+	assert.Equal(t, aliveSet.Size(), len(gtw.serverPool.alives))
+	assert.Equal(t, disconnectedSet.Size(), len(gtw.serverPool.disconnected))
 
 	remainingSet := hashset.New()
 	remainingServers := gtw.copyAlive()
@@ -230,7 +232,7 @@ func TestGatewayHealthCheckReport(t *testing.T) {
 	diff := remainingSet.Difference(aliveSet)
 	assert.True(t, diff.Empty())
 
-	// Brings some dead servers alive
+	// Resurrect some disconnected servers
 	resurrectCount := 0
 	for i := 0; i < serverNum; i++ {
 		rawUrl := fmt.Sprintf("http://localhost:%d", 8000+i)
@@ -238,24 +240,36 @@ func TestGatewayHealthCheckReport(t *testing.T) {
 			httpmock.RegisterResponder("GET", rawUrl+"/health_check",
 				httpmock.NewStringResponder(200, fmt.Sprintf("Service %d is Alive", i)))
 			aliveSet.Add(rawUrl)
-			deadSet.Remove(rawUrl)
+			disconnectedSet.Remove(rawUrl)
 			resurrectCount++
 		}
 	}
-	gtw.resurrectServers()
-	assert.Equal(t, aliveSet.Size(), gtw.serverPool.Len())
-	assert.Equal(t, deadSet.Size(), len(gtw.serverPool.dead))
-
-	// Report to the monitor
-	err := gtw.report()
-	assert.Nil(t, err)
-	assert.Equal(t, aliveSet.Size(), gtw.serverPool.Len())
+	gtw.resurrectDisconnected()
+	assert.Equal(t, aliveSet.Size(), len(gtw.serverPool.alives))
+	assert.Equal(t, disconnectedSet.Size(), len(gtw.serverPool.disconnected))
 	assert.Equal(t, 0, len(gtw.serverPool.dead))
+
+	// Retry resurrect several times
+	gtw.resurrectDisconnected()
+	gtw.resurrectDisconnected()
+	deadSet := disconnectedSet.Difference(hashset.New())
+	disconnectedSet.Clear()
+	assert.Equal(t, aliveSet.Size(), len(gtw.serverPool.alives))
+	assert.Equal(t, disconnectedSet.Size(), len(gtw.serverPool.disconnected))
+	assert.Equal(t, deadSet.Size(), len(gtw.serverPool.dead))
 }
 
-func TestGatewayRetry(t *testing.T) {
+// func TestGatewayMonitor(t *testing.T) {
 
-}
+// 	// err := gtw.report()
+// 	// assert.Nil(t, err)
+// 	// assert.Equal(t, aliveSet.Size(), len(gtw.serverPool.alives))
+// 	// assert.Equal(t, 0, len(gtw.serverPool.dead))
+// }
+
+// func TestGatewayRetry(t *testing.T) {
+
+// }
 
 // func TestGatewayHTTP(t *testing.T) {
 // 	gtw := NewGateway()

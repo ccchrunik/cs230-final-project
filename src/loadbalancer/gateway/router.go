@@ -31,11 +31,11 @@ func CreateAdminServer(port int, gtw *Gateway) *gin.Engine {
 		}
 
 		for _, a := range servers.Adds {
-			gtw.AddServer(NewBackend(a, gtw))
+			gtw.Add(NewBackend(a, gtw))
 		}
 
 		for _, d := range servers.Removes {
-			gtw.RemoveServer(d)
+			gtw.Remove(d)
 		}
 
 		c.JSON(http.StatusOK, nil)

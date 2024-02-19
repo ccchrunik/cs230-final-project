@@ -65,7 +65,7 @@ func genRetryErrorHandler(serverUrl *url.URL, proxy *httputil.ReverseProxy, gtw 
 		}
 
 		// this server failes, remove it from our list
-		gtw.RemoveServer(serverUrl.String())
+		gtw.Remove(serverUrl.String())
 
 		attempts := GetAttemptsFromContext(r)
 		log.Printf("%s(%s) Attempting retry %d\n", r.RemoteAddr, r.URL.Path, attempts)
