@@ -9,9 +9,11 @@ import (
 )
 
 // Context key
+type ContextKey int
+
 const (
-	Attempts int = iota
-	Retry
+	Attempts ContextKey = iota
+	Retries
 )
 
 func GetAttemptsFromContext(r *http.Request) int {
@@ -22,7 +24,7 @@ func GetAttemptsFromContext(r *http.Request) int {
 }
 
 func GetRetryFromContext(r *http.Request) int {
-	if retry, ok := r.Context().Value(Retry).(int); ok {
+	if retry, ok := r.Context().Value(Retries).(int); ok {
 		return retry
 	}
 	return 0
@@ -77,23 +79,29 @@ func reportDeadBackends(monitorUrl string, dead []string) error {
 	return nil
 }
 
-func healthCheck(gtw *Gateway, duration time.Duration) {
+func HealthCheck(gtw *Gateway, duration time.Duration) {
 	healthCheckWithCount(gtw, duration, -1)
 }
 
 func healthCheckWithCount(gtw *Gateway, duration time.Duration, maxCount int) {
 	t := time.NewTicker(duration)
 	count := 0
-	for {
-		select {
-		case <-t.C:
-			log.Println("Starting health check...")
-			gtw.healthCheck()
-			log.Println("Health check completed")
-			count++
-			if maxCount >= 0 && count >= maxCount {
-				return
-			}
+	for range t.C {
+		log.Println("Starting health check...")
+		gtw.healthCheck()
+		log.Println("Health check completed")
+		count++
+		if maxCount >= 0 && count >= maxCount {
+			return
 		}
+	}
+}
+
+func ResurrectServer(gtw *Gateway, duration time.Duration) {
+	t := time.NewTicker(duration)
+	for range t.C {
+		log.Println("Starting server resurrection...")
+		gtw.resurrectDisconnected()
+		log.Println("Resurrection completed")
 	}
 }

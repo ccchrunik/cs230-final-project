@@ -300,24 +300,24 @@ func (g *Gateway) healthCheck() {
 
 func (g *Gateway) resurrectDisconnected() {
 	backends := g.copyDisconnected()
-	var wg sync.WaitGroup
-	wg.Add(len(backends))
+	// var wg sync.WaitGroup
+	// wg.Add(len(backends))
 	for _, b := range backends {
-		go func(b *Backend) {
-			rawUrl := b.rawUrl()
-			alive := isBackendAlive(rawUrl + "/health_check")
-			if alive {
-				g.Resurrect(rawUrl)
-			} else if b.Retries >= 3 {
-				g.Disconnect(rawUrl)
-			} else {
-				// fmt.Printf("%s: %d\n", rawUrl, b.Retries)
-				b.Retries++
-			}
-			wg.Done()
-		}(b)
+		// go func(b *Backend) {
+		rawUrl := b.rawUrl()
+		alive := isBackendAlive(rawUrl + "/health_check")
+		if alive {
+			g.Resurrect(rawUrl)
+		} else if b.Retries >= 3 {
+			g.Disconnect(rawUrl)
+		} else {
+			// fmt.Printf("%s: %d\n", rawUrl, b.Retries)
+			b.Retries++
+		}
+		// wg.Done()
+		// }(b)
 	}
-	wg.Wait()
+	// wg.Wait()
 }
 
 func (g *Gateway) report() error {

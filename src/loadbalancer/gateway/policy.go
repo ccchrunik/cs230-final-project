@@ -33,6 +33,7 @@ func (rr *RandomPolicy) Select(p *ServerPool) *Backend {
 
 func genLoadBalancer(gtw *Gateway) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// fmt.Println("lb")
 		attempts := GetAttemptsFromContext(r)
 		if attempts > 3 {
 			log.Printf("%s(%s) Max attempts reached, terminating\n", r.RemoteAddr, r.URL.Path)
@@ -42,6 +43,7 @@ func genLoadBalancer(gtw *Gateway) func(w http.ResponseWriter, r *http.Request) 
 
 		next := gtw.NextServer()
 		if next != nil {
+			log.Println(next)
 			next.ReverseProxy.ServeHTTP(w, r)
 			return
 		}
@@ -53,18 +55,21 @@ func genRetryErrorHandler(serverUrl *url.URL, proxy *httputil.ReverseProxy, gtw 
 	lb := genLoadBalancer(gtw)
 
 	return func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[%s] %s\n", serverUrl.Host, err.Error())
+		// fmt.Println("proxy error handler")
+		// log.Printf("[%s] %s\n", serverUrl.Host, err.Error())
 		retries := GetRetryFromContext(r)
 		if retries < 3 {
-			select {
-			case <-time.After(10 * time.Millisecond):
-				ctx := context.WithValue(r.Context(), Retry, retries+1)
-				proxy.ServeHTTP(w, r.WithContext(ctx))
-			}
+			// fmt.Println("retry")
+			<-time.After(10 * time.Millisecond)
+			ctx := context.WithValue(r.Context(), Retries, retries+1)
+			// fmt.Println("retry")
+			proxy.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 
-		// this server failes, remove it from our list
+		// fmt.Println("endpoint failed")
+
+		// this server fails, remove it from our list
 		gtw.Remove(serverUrl.String())
 
 		attempts := GetAttemptsFromContext(r)

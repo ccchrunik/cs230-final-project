@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -259,44 +260,72 @@ func TestGatewayHealthCheckReport(t *testing.T) {
 	assert.Equal(t, deadSet.Size(), len(gtw.serverPool.dead))
 }
 
+func TestGatewayHTTP(t *testing.T) {
+	gtw := NewGateway()
+
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	httpmock.RegisterResponder("GET", "http://localhost:8000/",
+		httpmock.NewStringResponder(200, "Service 0"))
+
+	gtw.Add(NewBackend("http://localhost:8000", gtw))
+	gtw.Add(NewBackend("http://localhost:8001", gtw))
+
+	assert.Equal(t, 2, len(gtw.serverPool.alives))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
+	assert.Equal(t, 0, len(gtw.serverPool.dead))
+
+	req, _ := http.NewRequest("GET", "/", nil)
+	resp := newCloseNotifyingRecorder()
+
+	server := CreateServer(3000, gtw)
+
+	server.Handler.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.Equal(t, "Service 0", resp.Body.String())
+
+	// service 1 fails -> connect to service 0
+	req, _ = http.NewRequest("GET", "/", nil)
+	resp = newCloseNotifyingRecorder()
+	server.Handler.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.Equal(t, "Service 0", resp.Body.String())
+
+	// service one comes back
+	httpmock.RegisterResponder("GET", "http://localhost:8001/",
+		httpmock.NewStringResponder(200, "Service 1"))
+	httpmock.RegisterResponder("GET", "http://localhost:8001/health_check",
+		httpmock.NewStringResponder(200, "Service 1"))
+
+	gtw.resurrectDisconnected()
+	assert.Equal(t, 2, len(gtw.serverPool.alives))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
+	assert.Equal(t, 0, len(gtw.serverPool.dead))
+
+	req, _ = http.NewRequest("GET", "/", nil)
+	resp = newCloseNotifyingRecorder()
+	server.Handler.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.Equal(t, "Service 0", resp.Body.String())
+
+	assert.Equal(t, 2, len(gtw.serverPool.alives))
+	assert.Equal(t, 0, len(gtw.serverPool.disconnected))
+	assert.Equal(t, 0, len(gtw.serverPool.dead))
+
+	req, _ = http.NewRequest("GET", "/", nil)
+	resp = newCloseNotifyingRecorder()
+	server.Handler.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusOK, resp.Code)
+	assert.Equal(t, "Service 1", resp.Body.String())
+}
+
 // func TestGatewayMonitor(t *testing.T) {
 
 // 	// err := gtw.report()
 // 	// assert.Nil(t, err)
 // 	// assert.Equal(t, aliveSet.Size(), len(gtw.serverPool.alives))
 // 	// assert.Equal(t, 0, len(gtw.serverPool.dead))
-// }
-
-// func TestGatewayRetry(t *testing.T) {
-
-// }
-
-// func TestGatewayHTTP(t *testing.T) {
-// 	gtw := NewGateway()
-
-// 	serverNum := 100
-// 	backends := []*Backend{}
-// 	for i := 0; i < serverNum; i++ {
-// 		backend := NewBackend(fmt.Sprintf("http://localhost:%d", 8000+i))
-// 		backends = append(backends, backend)
-// 		gtw.AddServer(backend)
-// 	}
-
-// 	gtw.sync()
-
-// 	httpmock.Activate()
-// 	defer httpmock.DeactivateAndReset()
-
-// 	for i := 0; i < serverNum; i++ {
-// 		httpmock.RegisterResponder("GET", fmt.Sprintf("http://localhost:%d", 8000+i),
-// 			httpmock.NewStringResponder(200, fmt.Sprintf("Service %d", i)))
-// 	}
-
-// 	for i := 0; i < serverNum; i++ {
-// 		req, _ := http.NewRequest("GET", "/service1/test", nil)
-// 		resp := newCloseNotifyingRecorder()
-// 	}
-
 // }
 
 // func TestCreateRouter(t *testing.T) {

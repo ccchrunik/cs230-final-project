@@ -19,13 +19,21 @@ func CreateServer(port int, gtw *Gateway) *http.Server {
 	}
 }
 
-func CreateAdminServer(port int, gtw *Gateway) *gin.Engine {
+func CreateAdminServer(gtw *Gateway) *gin.Engine {
 	r := gin.Default()
 
-	r.POST("/update_servers", func(c *gin.Context) {
+	r.GET("/servers", func(c *gin.Context) {
+		servers := []string{}
+		for _, server := range gtw.copyAlive() {
+			servers = append(servers, server.rawUrl())
+		}
+		c.JSON(http.StatusOK, servers)
+	})
+
+	r.PUT("/servers", func(c *gin.Context) {
 		var servers Servers
 
-		if c.ShouldBind(&servers) == nil {
+		if err := c.ShouldBind(&servers); err != nil {
 			c.JSON(http.StatusBadRequest, nil)
 			return
 		}
